@@ -40,13 +40,18 @@
 #define TXT_ACK_DELAY 200
 #endif
 
-#define FIRMWARE_VER_LEVEL 1
+#define FIRMWARE_VER_LEVEL 2
 
 #define REQ_TYPE_GET_STATUS 0x01
 #define REQ_TYPE_KEEP_ALIVE 0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA 0x03
 #define REQ_TYPE_GET_ACCESS_LIST 0x05
 #define REQ_TYPE_GET_NEIGHBOURS 0x06
+#define REQ_TYPE_GET_OWNER_INFO 0x07
+
+#define ANON_REQ_TYPE_REGIONS 0x01
+#define ANON_REQ_TYPE_OWNER 0x02
+#define ANON_REQ_TYPE_BASIC 0x03  // just remote clock
 
 #define RESP_SERVER_LOGIN_OK 0
 
@@ -164,6 +169,162 @@ bool MyMesh::processAck(const uint8_t* data) {
   return false;
 }
 
+uint8_t MyMesh::handleAnonRegionsReq(const mesh::Identity& sender,
+                                     uint32_t sender_timestamp,
+                                     const uint8_t* data) {
+  if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
+    // request data has: {reply-path-len}{reply-path}
+    reply_path_len = *data++ & 0x3F;
+    memcpy(reply_path, data, reply_path_len);
+    // data += reply_path_len;
+
+    memcpy(reply_data, &sender_timestamp,
+           4);  // prefix with sender_timestamp, like a tag
+    uint32_t now = getRTCClock()->getCurrentTime();
+    memcpy(&reply_data[4], &now, 4);  // include our clock (for easy clock sync,
+                                      // and packet hash uniqueness)
+
+    return 8 + region_map.exportNamesTo((char*)&reply_data[8],
+                                        sizeof(reply_data) - 12,
+                                        REGION_DENY_FLOOD);  // reply length
+  }
+  return 0;
+}
+
+uint8_t MyMesh::handleAnonOwnerReq(const mesh::Identity& sender,
+                                   uint32_t sender_timestamp,
+                                   const uint8_t* data) {
+  if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
+    // request data has: {reply-path-len}{reply-path}
+    reply_path_len = *data++ & 0x3F;
+    memcpy(reply_path, data, reply_path_len);
+    // data += reply_path_len;
+
+    memcpy(reply_data, &sender_timestamp,
+           4);  // prefix with sender_timestamp, like a tag
+    uint32_t now = getRTCClock()->getCurrentTime();
+    memcpy(&reply_data[4], &now, 4);  // include our clock (for easy clock sync,
+                                      // and packet hash uniqueness)
+    sprintf((char*)&reply_data[8], "%s\n%s", _prefs.node_name,
+            _prefs.owner_info);
+
+    return 8 + strlen((char*)&reply_data[8]);  // reply length
+  }
+  return 0;
+}
+
+uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender,
+                                   uint32_t sender_timestamp,
+                                   const uint8_t* data) {
+  if (anon_limiter.allow(rtc_clock.getCurrentTime())) {
+    // request data has: {reply-path-len}{reply-path}
+    reply_path_len = *data++ & 0x3F;
+    memcpy(reply_path, data, reply_path_len);
+    // data += reply_path_len;
+
+    memcpy(reply_data, &sender_timestamp,
+           4);  // prefix with sender_timestamp, like a tag
+    uint32_t now = getRTCClock()->getCurrentTime();
+    memcpy(&reply_data[4], &now, 4);  // include our clock (for easy clock sync,
+                                      // and packet hash uniqueness)
+    reply_data[8] = 0;                // features
+#ifdef WITH_RS232_BRIDGE
+    reply_data[8] |= 0x01;  // is bridge, type UART
+#elif WITH_ESPNOW_BRIDGE
+    reply_data[8] |= 0x03;  // is bridge, type ESP-NOW
+#endif
+    if (_prefs.disable_fwd) {  // is this repeater currently disabled
+      reply_data[8] |= 0x80;   // is disabled
+    }
+    // TODO:  add some kind of moving-window utilisation metric, so can query
+    // 'how busy' is this repeater
+    return 9;  // reply length
+  }
+  return 0;
+}
+
+uint8_t MyMesh::handleLoginReq(const mesh::Identity& sender,
+                               const uint8_t* secret, uint32_t sender_timestamp,
+                               const uint8_t* data, mesh::Packet* pkt,
+                               bool is_room) {
+  uint32_t sender_sync_since = 0;
+  char* password = NULL;
+
+  ClientInfo* client = NULL;
+  uint8_t perm = 0;
+
+  if (is_room) {
+    memcpy(&sender_sync_since, &data[4], 4);
+    password = (char*)(data + 8);
+  } else {
+    password = (char*)(data + 4);
+  }
+
+  if (password[0] == 0) {
+    client = acl.getClient(sender.pub_key, PUB_KEY_SIZE);
+  }
+
+  if (client == NULL) {
+    if (strcmp(password, _prefs.password) == 0) {
+      perm = PERM_ACL_ADMIN;
+    } else if (strcmp(password, _prefs.guest_password) == 0) {
+      perm = PERM_ACL_READ_WRITE;  // Guest/Room User
+    } else {
+      if (is_room) {
+        password = (char*)(data + 4);
+        if (strcmp(password, _prefs.password) == 0) {
+          perm = PERM_ACL_ADMIN;
+          sender_sync_since = 0;  // repeater login?
+        }
+      }
+    }
+  }
+
+  if (client == NULL && perm == 0) {
+    return 0;
+  }
+
+  if (client == NULL) {
+    client = acl.putClient(sender, 0);
+    if (sender_timestamp <= client->last_timestamp) {
+      return 0;
+    }
+    client->last_timestamp = sender_timestamp;
+    client->extra.room.sync_since = sender_sync_since;
+    client->extra.room.pending_ack = 0;
+    client->extra.room.push_failures = 0;
+    client->last_activity = getRTCClock()->getCurrentTime();
+    client->permissions |= perm;
+    memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
+    dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+
+    if (getRTCClock()->getCurrentTime() < sender_timestamp - 60) {
+#if MESH_DEBUG
+      MESH_DEBUG_PRINTLN("Updating Clock from Auth Login: %u -> %u",
+                         getRTCClock()->getCurrentTime(), sender_timestamp);
+#endif
+      getRTCClock()->setCurrentTime(sender_timestamp);
+    }
+  }
+
+  if (pkt->isRouteFlood()) {
+    client->out_path_len = -1;
+  }
+
+  uint32_t now = getRTCClock()->getCurrentTimeUnique();
+  memcpy(reply_data, &now, 4);
+  reply_data[4] = RESP_SERVER_LOGIN_OK;
+  reply_data[5] = 0;
+  reply_data[6] = (client->isAdmin() ? 1 : 0);
+  reply_data[7] = client->permissions;
+  getRNG()->random(&reply_data[8], 4);
+  reply_data[12] = FIRMWARE_VER_LEVEL;
+
+  next_push = futureMillis(PUSH_NOTIFY_DELAY_MILLIS);
+
+  return 13;  // reply length
+}
+
 int MyMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
                           uint8_t* payload, size_t payload_len) {
   memcpy(reply_data, &sender_timestamp, 4);
@@ -204,6 +365,15 @@ int MyMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
       perm_mask = 0x00;
     }
     sensors.querySensors(perm_mask, telemetry);
+
+    // This default temperature will be overridden by external sensors (if any)
+    float temperature = board.getMCUTemperature();
+    if (!isnan(temperature)) {  // Supported boards with built-in temperature
+                                // sensor. ESP32-C3 may return NAN
+      telemetry.addTemperature(TELEM_CHANNEL_SELF,
+                               temperature);  // Built-in MCU Temperature
+    }
+
     uint8_t tlen = telemetry.getSize();
     memcpy(&reply_data[4], telemetry.getBuffer(), tlen);
     return 4 + tlen;
@@ -294,6 +464,10 @@ int MyMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
         reply_offset += results_offset;
         return reply_offset;
       }
+    } else if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
+      sprintf((char*)&reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION,
+              _prefs.node_name, _prefs.owner_info);
+      return 4 + strlen((char*)&reply_data[4]);
     }
   }
 
@@ -465,104 +639,50 @@ bool MyMesh::filterRecvFloodPacket(mesh::Packet* pkt) {
   return false;
 }
 
-void MyMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
+void MyMesh::onAnonDataRecv(mesh::Packet* pkt, const uint8_t* secret,
                             const mesh::Identity& sender, uint8_t* data,
                             size_t len) {
-  if (packet->getPayloadType() == PAYLOAD_TYPE_ANON_REQ) {
-    uint32_t sender_timestamp;
-    memcpy(&sender_timestamp, data, 4);
+  if (pkt->getPayloadType() == PAYLOAD_TYPE_ANON_REQ) {
+    uint32_t timestamp;
+    memcpy(&timestamp, data, 4);
 
-    uint32_t sender_sync_since = 0;
-    char* password = NULL;
+    data[len] = 0;  // ensure null terminator
+    uint8_t reply_len;
 
-    // detect if this is a room-style request (timestamp + sync_since +
-    // password) OR repeater-style (timestamp + password)
-    bool looksLikeRoom = (len >= 9);  // need at least 4+4+1 bytes
+    bool is_room = room_id.isHashMatch(&pkt->payload[0]);
 
-    ClientInfo* client = NULL;
-    uint8_t perm = 0;
-
-    if (looksLikeRoom) {
-      memcpy(&sender_sync_since, &data[4], 4);
-      password = (char*)&data[8];
+    reply_path_len = -1;
+    if (is_room || (data[4] == 0 || data[4] >= ' ')) {
+      reply_len =
+          handleLoginReq(sender, secret, timestamp, &data[0], pkt, is_room);
+    } else if (data[4] == ANON_REQ_TYPE_REGIONS && pkt->isRouteDirect()) {
+      reply_len = handleAnonRegionsReq(sender, timestamp, &data[5]);
+    } else if (data[4] == ANON_REQ_TYPE_OWNER && pkt->isRouteDirect()) {
+      reply_len = handleAnonOwnerReq(sender, timestamp, &data[5]);
+    } else if (data[4] == ANON_REQ_TYPE_BASIC && pkt->isRouteDirect()) {
+      reply_len = handleAnonClockReq(sender, timestamp, &data[5]);
     } else {
-      password = (char*)&data[4];
-    }
-    data[len] = 0;
-
-    if (password[0] == 0) {
-      client = acl.getClient(sender.pub_key, PUB_KEY_SIZE);
+      reply_len = 0;  // unknown/invalid request type
     }
 
-    if (client == NULL) {
-      if (strcmp(password, _prefs.password) == 0) {
-        perm = PERM_ACL_ADMIN;
-      } else if (strcmp(password, _prefs.guest_password) == 0) {
-        perm = PERM_ACL_READ_WRITE;  // Guest/Room User
-      } else {
-        if (looksLikeRoom) {
-          if (strcmp((char*)&data[4], _prefs.password) == 0) {
-            perm = PERM_ACL_ADMIN;
-            sender_sync_since = 0;  // repeater login?
-          }
-        }
-      }
-    }
+    if (reply_len == 0) return;  // invalid request
 
-    if (client == NULL && perm == 0) {
-      return;
-    }
-
-    if (client == NULL) {
-      client = acl.putClient(sender, 0);
-      if (sender_timestamp <= client->last_timestamp) {
-        return;
-      }
-      client->last_timestamp = sender_timestamp;
-      client->extra.room.sync_since = sender_sync_since;
-      client->extra.room.pending_ack = 0;
-      client->extra.room.push_failures = 0;
-      client->last_activity = getRTCClock()->getCurrentTime();
-      client->permissions |= perm;
-      memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
-      dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
-
-      if (getRTCClock()->getCurrentTime() < sender_timestamp - 60) {
-#if MESH_DEBUG
-        MESH_DEBUG_PRINTLN("Updating Clock from Auth Login: %u -> %u",
-                           getRTCClock()->getCurrentTime(), sender_timestamp);
-#endif
-        getRTCClock()->setCurrentTime(sender_timestamp);
-      }
-    }
-
-    if (packet->isRouteFlood()) {
-      client->out_path_len = -1;
-    }
-
-    uint32_t now = getRTCClock()->getCurrentTimeUnique();
-    memcpy(reply_data, &now, 4);
-    reply_data[4] = RESP_SERVER_LOGIN_OK;
-    reply_data[5] = 0;
-    reply_data[6] = (client->isAdmin() ? 1 : 0);
-    reply_data[7] = client->permissions;
-    getRNG()->random(&reply_data[8], 4);
-    reply_data[12] = FIRMWARE_VER_LEVEL;
-
-    int reply_len = 13;
-
-    next_push = futureMillis(PUSH_NOTIFY_DELAY_MILLIS);
-
-    if (packet->isRouteFlood()) {
-      mesh::Packet* path = createPathReturn(
-          sender, client->shared_secret, packet->path, packet->path_len,
-          PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
+    if (pkt->isRouteFlood()) {
+      // let this sender know path TO here, so they can use sendDirect(), and
+      // ALSO encode the response
+      mesh::Packet* path =
+          createPathReturn(sender, secret, pkt->path, pkt->path_len,
+                           PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
       if (path) sendFlood(path, SERVER_RESPONSE_DELAY);
-    } else {
-      mesh::Packet* reply =
-          createDatagram(PAYLOAD_TYPE_RESPONSE, sender, client->shared_secret,
-                         reply_data, reply_len);
+    } else if (reply_path_len < 0) {
+      mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender,
+                                           secret, reply_data, reply_len);
       if (reply) sendFlood(reply, SERVER_RESPONSE_DELAY);
+    } else {
+      mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender,
+                                           secret, reply_data, reply_len);
+      if (reply)
+        sendDirect(reply, reply_path, reply_path_len, SERVER_RESPONSE_DELAY);
     }
   }
 }
@@ -873,9 +993,13 @@ void MyMesh::onAckRecv(mesh::Packet* packet, uint32_t ack_crc) {
   }
 }
 
+#define CTL_TYPE_NODE_DISCOVER_REQ 0x80
+#define CTL_TYPE_NODE_DISCOVER_RESP 0x90
+
 void MyMesh::onControlDataRecv(mesh::Packet* packet) {
   uint8_t type = packet->payload[0] & 0xF0;
-  if (type == 0x80 && packet->payload_len >= 6 &&
+  if (type == CTL_TYPE_NODE_DISCOVER_REQ && packet->payload_len >= 6 &&
+      !_prefs.disable_fwd &&
       discover_limiter.allow(rtc_clock.getCurrentTime())) {
     int i = 1;
     uint8_t filter = packet->payload[i++];
@@ -907,7 +1031,8 @@ MyMesh::MyMesh(mesh::MainBoard& board, mesh::Radio& radio,
       telemetry(MAX_PACKET_PAYLOAD - 4),
       region_map(key_store),
       temp_map(key_store),
-      discover_limiter(4, 120)
+      discover_limiter(4, 120),
+      anon_limiter(4, 180)  // max 4 every 3 minutes
 #if defined(WITH_RS232_BRIDGE)
       ,
       bridge(&_prefs, WITH_RS232_BRIDGE, _mgr, &rtc)
@@ -1276,4 +1401,9 @@ void MyMesh::removeNeighbor(const uint8_t* pubkey, int key_len) {
 
 void MyMesh::formatNeighborsReply(char* reply) {
   strcpy(reply, "Use 'get neighbours'");
+}
+
+// To check if there is pending work
+bool MyMesh::hasPendingWork() const {
+  return _mgr->getOutboundCount(0xFFFFFFFF) > 0;
 }
