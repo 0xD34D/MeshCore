@@ -91,7 +91,9 @@ void setup() {
 #endif
 
   // send out initial Advertisement to the mesh
-  the_mesh.sendSelfAdvertisement(16000);
+#if ENABLE_ADVERT_ON_BOOT == 1
+  the_mesh.sendSelfAdvertisement(16000, false);
+#endif
 }
 
 void loop() {

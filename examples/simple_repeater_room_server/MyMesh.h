@@ -41,11 +41,11 @@ extern AbstractBridge* bridge;
 #endif
 
 #ifndef FIRMWARE_BUILD_DATE
-#define FIRMWARE_BUILD_DATE "25 Jan 2026"
+#define FIRMWARE_BUILD_DATE "15 Feb 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.11.0"
+#define FIRMWARE_VERSION "v1.13.0"
 #endif
 
 #define FIRMWARE_ROLE "repeater_server"
@@ -86,6 +86,7 @@ struct HybridStats {
   int16_t last_snr;  // x 4
   uint16_t n_direct_dups, n_flood_dups;
   uint32_t total_rx_air_time_secs;
+  uint32_t n_recv_errors;
   // Room specific
   uint16_t n_posted, n_post_push;
 };
@@ -242,7 +243,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr,
                             int timeout_mins) override;
   bool formatFileSystem() override;
-  void sendSelfAdvertisement(int delay_millis) override;
+  void sendSelfAdvertisement(int delay_millis, bool flood) override;
   void sendRoomAdvertisement(int delay_millis);
   mesh::Packet* createRoomAdvert();
 
@@ -252,7 +253,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void setLoggingOn(bool enable) override { _logging = enable; }
   void eraseLogFile() override { _fs->remove(PACKET_LOG_FILE); }
   void dumpLogFile() override;
-  void setTxPower(uint8_t power_dbm) override;
+  void setTxPower(int8_t power_dbm) override;
 
   void formatNeighborsReply(char* reply) override;
   void removeNeighbor(const uint8_t* pubkey, int key_len) override;

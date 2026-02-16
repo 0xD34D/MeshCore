@@ -348,6 +348,7 @@ int MyMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
     stats.n_direct_dups = ((SimpleMeshTables*)getTables())->getNumDirectDups();
     stats.n_flood_dups = ((SimpleMeshTables*)getTables())->getNumFloodDups();
     stats.total_rx_air_time_secs = getReceiveAirTime() / 1000;
+    stats.n_recv_errors = radio_driver.getPacketsRecvErrors();
     stats.n_posted = _num_posted;
     stats.n_post_push = _num_post_pushes;
 
@@ -501,10 +502,14 @@ mesh::Packet* MyMesh::createRoomAdvert() {
   }
 }
 
-void MyMesh::sendSelfAdvertisement(int delay_millis) {
+void MyMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
   mesh::Packet* pkt = createSelfAdvert();
   if (pkt) {
-    sendFlood(pkt, delay_millis);
+    if (flood) {
+      sendFlood(pkt, delay_millis);
+    } else {
+      sendZeroHop(pkt, delay_millis);
+    }
     // schedule room advert 4 seconds later (chained after this one)
     next_room_advert = futureMillis(delay_millis + 4000);
   } else {
@@ -1027,7 +1032,7 @@ MyMesh::MyMesh(mesh::MainBoard& board, mesh::Radio& radio,
                mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc,
                mesh::MeshTables& tables)
     : mesh::Mesh(radio, ms, rng, rtc, *new StaticPoolPacketManager(32), tables),
-      _cli(board, rtc, sensors, &_prefs, this),
+      _cli(board, rtc, sensors, acl, &_prefs, this),
       telemetry(MAX_PACKET_PAYLOAD - 4),
       region_map(key_store),
       temp_map(key_store),
@@ -1102,7 +1107,7 @@ void MyMesh::begin(FILESYSTEM* fs) {
   mesh::Mesh::begin();
   _fs = fs;
   _cli.loadPrefs(_fs);
-  acl.load(_fs);
+  acl.load(_fs, self_id);
   region_map.load(_fs);
 
 #if defined(WITH_BRIDGE)
@@ -1221,7 +1226,7 @@ void MyMesh::loop() {
 
   if (next_local_advert && (long)(now - next_local_advert) >= 0) {
     updateAdvertTimer();
-    sendSelfAdvertisement(200);
+    sendSelfAdvertisement(200, false);
   }
 
   if (next_room_advert && (long)(now - next_room_advert) >= 0) {
@@ -1232,7 +1237,7 @@ void MyMesh::loop() {
   if (next_flood_advert && now >= next_flood_advert) {
     next_flood_advert =
         futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000);
-    sendSelfAdvertisement(2000);
+    sendSelfAdvertisement(2000, true);
   }
 
   if (millisHasNowPassed(next_push) && acl.getNumClients() > 0) {
@@ -1345,7 +1350,7 @@ void MyMesh::dumpLogFile() {
   }
 }
 
-void MyMesh::setTxPower(uint8_t power_dbm) { radio_set_tx_power(power_dbm); }
+void MyMesh::setTxPower(int8_t power_dbm) { radio_set_tx_power(power_dbm); }
 
 void MyMesh::saveIdentity(const mesh::LocalIdentity& new_id) {
   self_id = new_id;
@@ -1379,13 +1384,206 @@ void MyMesh::formatPacketStatsReply(char* reply) {
 
 void MyMesh::handleCommand(uint32_t sender_timestamp, char* command,
                            char* reply) {
-  while (*command == ' ') command++;
-  if (strlen(command) > 4 && command[2] == '|') {
-    memcpy(reply, command, 3);
+  if (region_load_active) {
+    if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate
+                                        // 'load' operation
+      region_map = temp_map;  // copy over the temp instance as new current map
+      region_load_active = false;
+
+      sprintf(reply, "OK - loaded %d regions", region_map.getCount());
+    } else {
+      char* np = command;
+      while (*np == ' ') np++;  // skip indent
+      int indent = np - command;
+
+      char* ep = np;
+      while (RegionMap::is_name_char(*ep)) ep++;
+      if (*ep) {
+        *ep++ = 0;
+      }  // set null terminator for end of name
+
+      while (*ep && *ep != 'F') ep++;  // look for (optional) flags
+
+      if (indent > 0 && indent < 8 && strlen(np) > 0) {
+        auto parent = load_stack[indent - 1];
+        if (parent) {
+          auto old = region_map.findByName(np);
+          auto nw = temp_map.putRegion(
+              np, parent->id,
+              old ? old->id
+                  : 0);  // carry-over the current ID (if name already exists)
+          if (nw) {
+            nw->flags =
+                old ? old->flags
+                    : (*ep == 'F'
+                           ? 0
+                           : REGION_DENY_FLOOD);  // carry-over flags from curr
+
+            load_stack[indent] =
+                nw;  // keep pointers to parent regions, to resolve parent_id's
+          }
+        }
+      }
+      reply[0] = 0;
+    }
+    return;
+  }
+
+  while (*command == ' ') command++;  // skip leading spaces
+
+  if (strlen(command) > 4 &&
+      command[2] == '|') {      // optional prefix (for companion radio CLI)
+    memcpy(reply, command, 3);  // reflect the prefix back
     reply += 3;
     command += 3;
   }
-  _cli.handleCommand(sender_timestamp, command, reply);
+
+  // handle ACL related commands
+  if (memcmp(command, "setperm ", 8) ==
+      0) {  // format:  setperm {pubkey-hex} {permissions-int8}
+    char* hex = &command[8];
+    char* sp = strchr(hex, ' ');  // look for separator char
+    if (sp == NULL) {
+      strcpy(reply, "Err - bad params");
+    } else {
+      *sp++ = 0;  // replace space with null terminator
+
+      uint8_t pubkey[PUB_KEY_SIZE];
+      int hex_len = min(sp - hex, PUB_KEY_SIZE * 2);
+      if (mesh::Utils::fromHex(pubkey, hex_len / 2, hex)) {
+        uint8_t perms = atoi(sp);
+        if (acl.applyPermissions(self_id, pubkey, hex_len / 2, perms)) {
+          dirty_contacts_expiry =
+              futureMillis(LAZY_CONTACTS_WRITE_DELAY);  // trigger acl.save()
+          strcpy(reply, "OK");
+        } else {
+          strcpy(reply, "Err - invalid params");
+        }
+      } else {
+        strcpy(reply, "Err - bad pubkey");
+      }
+    }
+  } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
+    Serial.println("ACL:");
+    for (int i = 0; i < acl.getNumClients(); i++) {
+      auto c = acl.getClientByIdx(i);
+      if (c->permissions == 0) continue;  // skip deleted (or guest) entries
+
+      Serial.printf("%02X ", c->permissions);
+      mesh::Utils::printHex(Serial, c->id.pub_key, PUB_KEY_SIZE);
+      Serial.printf("\n");
+    }
+    reply[0] = 0;
+  } else if (memcmp(command, "region", 6) == 0) {
+    reply[0] = 0;
+
+    const char* parts[4];
+    int n = mesh::Utils::parseTextParts(command, parts, 4, ' ');
+    if (n == 1) {
+      region_map.exportTo(reply, 160);
+    } else if (n >= 2 && strcmp(parts[1], "load") == 0) {
+      temp_map.resetFrom(region_map);  // rebuild regions in a temp instance
+      memset(load_stack, 0, sizeof(load_stack));
+      load_stack[0] = &temp_map.getWildcard();
+      region_load_active = true;
+    } else if (n >= 2 && strcmp(parts[1], "save") == 0) {
+      _prefs.discovery_mod_timestamp =
+          rtc_clock.getCurrentTime();  // this node is now 'modified' (for
+                                       // discovery info)
+      savePrefs();
+      bool success = region_map.save(_fs);
+      strcpy(reply, success ? "OK" : "Err - save failed");
+    } else if (n >= 3 && strcmp(parts[1], "allowf") == 0) {
+      auto region = region_map.findByNamePrefix(parts[2]);
+      if (region) {
+        region->flags &= ~REGION_DENY_FLOOD;
+        strcpy(reply, "OK");
+      } else {
+        strcpy(reply, "Err - unknown region");
+      }
+    } else if (n >= 3 && strcmp(parts[1], "denyf") == 0) {
+      auto region = region_map.findByNamePrefix(parts[2]);
+      if (region) {
+        region->flags |= REGION_DENY_FLOOD;
+        strcpy(reply, "OK");
+      } else {
+        strcpy(reply, "Err - unknown region");
+      }
+    } else if (n >= 3 && strcmp(parts[1], "get") == 0) {
+      auto region = region_map.findByNamePrefix(parts[2]);
+      if (region) {
+        auto parent = region_map.findById(region->parent);
+        if (parent && parent->id != 0) {
+          sprintf(reply, " %s (%s) %s", region->name, parent->name,
+                  (region->flags & REGION_DENY_FLOOD) ? "" : "F");
+        } else {
+          sprintf(reply, " %s %s", region->name,
+                  (region->flags & REGION_DENY_FLOOD) ? "" : "F");
+        }
+      } else {
+        strcpy(reply, "Err - unknown region");
+      }
+    } else if (n >= 3 && strcmp(parts[1], "home") == 0) {
+      auto home = region_map.findByNamePrefix(parts[2]);
+      if (home) {
+        region_map.setHomeRegion(home);
+        sprintf(reply, " home is now %s", home->name);
+      } else {
+        strcpy(reply, "Err - unknown region");
+      }
+    } else if (n == 2 && strcmp(parts[1], "home") == 0) {
+      auto home = region_map.getHomeRegion();
+      sprintf(reply, " home is %s", home ? home->name : "*");
+    } else if (n >= 3 && strcmp(parts[1], "put") == 0) {
+      auto parent = n >= 4 ? region_map.findByNamePrefix(parts[3])
+                           : &region_map.getWildcard();
+      if (parent == NULL) {
+        strcpy(reply, "Err - unknown parent");
+      } else {
+        auto region = region_map.putRegion(parts[2], parent->id);
+        if (region == NULL) {
+          strcpy(reply, "Err - unable to put");
+        } else {
+          strcpy(reply, "OK");
+        }
+      }
+    } else if (n >= 3 && strcmp(parts[1], "remove") == 0) {
+      auto region = region_map.findByName(parts[2]);
+      if (region) {
+        if (region_map.removeRegion(*region)) {
+          strcpy(reply, "OK");
+        } else {
+          strcpy(reply, "Err - not empty");
+        }
+      } else {
+        strcpy(reply, "Err - not found");
+      }
+    } else if (n >= 3 && strcmp(parts[1], "list") == 0) {
+      uint8_t mask = 0;
+      bool invert = false;
+
+      if (strcmp(parts[2], "allowed") == 0) {
+        mask = REGION_DENY_FLOOD;
+        invert = false;  // list regions that DON'T have DENY flag
+      } else if (strcmp(parts[2], "denied") == 0) {
+        mask = REGION_DENY_FLOOD;
+        invert = true;  // list regions that DO have DENY flag
+      } else {
+        strcpy(reply, "Err - use 'allowed' or 'denied'");
+        return;
+      }
+
+      int len = region_map.exportNamesTo(reply, 160, mask, invert);
+      if (len == 0) {
+        strcpy(reply, "-none-");
+      }
+    } else {
+      strcpy(reply, "Err - ??");
+    }
+  } else {
+    _cli.handleCommand(sender_timestamp, command,
+                       reply);  // common CLI commands
+  }
 }
 
 void MyMesh::removeNeighbor(const uint8_t* pubkey, int key_len) {
