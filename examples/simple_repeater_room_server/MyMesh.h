@@ -41,11 +41,11 @@ extern AbstractBridge* bridge;
 #endif
 
 #ifndef FIRMWARE_BUILD_DATE
-#define FIRMWARE_BUILD_DATE "15 Feb 2026"
+#define FIRMWARE_BUILD_DATE "6 Jun 2026"
 #endif
 
 #ifndef FIRMWARE_VERSION
-#define FIRMWARE_VERSION "v1.13.0"
+#define FIRMWARE_VERSION "v1.16.0"
 #endif
 
 #define FIRMWARE_ROLE "repeater_server"
@@ -115,16 +115,20 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   unsigned long next_local_advert, next_flood_advert, next_room_advert;
   bool _logging;
   NodePrefs _prefs;
-  CommonCLI _cli;
   uint8_t reply_data[MAX_PACKET_PAYLOAD];
   uint8_t reply_path[MAX_PATH_SIZE];
   int8_t reply_path_len;
+  uint8_t reply_path_hash_size;
   ClientACL acl;
   TransportKeyStore key_store;
   RegionMap region_map, temp_map;
   RegionEntry* load_stack[8];
   RegionEntry* recv_pkt_region;
+  TransportKey default_scope;
+  CommonCLI _cli;
   RateLimiter discover_limiter, anon_limiter;
+  uint32_t pending_discover_tag;
+  unsigned long pending_discover_until;
   bool region_load_active;
   unsigned long dirty_contacts_expiry;
 
@@ -171,6 +175,7 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   bool processAck(const uint8_t* data);
   mesh::Packet* createSelfAdvert();
   File openAppend(const char* fname);
+  bool isLooped(const mesh::Packet* packet, const uint8_t max_counters[]);
 
  protected:
   mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override;
@@ -193,6 +198,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   int getInterferenceThreshold() const override {
     return _prefs.interference_threshold;
   }
+  bool getCADEnabled() const override {
+    return _prefs.cad_enabled;
+  }
   int getAGCResetInterval() const override {
     return ((int)_prefs.agc_reset_interval) * 4000;
   }
@@ -206,7 +214,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   }
 #endif
 
-  bool filterRecvFloodPacket(mesh::Packet* pkt) override;
+  void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis,
+                      uint8_t path_hash_size);
 
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
                       const mesh::Identity& sender, uint8_t* data,
@@ -231,6 +240,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
          mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
+  void sendNodeDiscoverReq();
+  void sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt,
+                       uint32_t delay_millis, uint8_t path_hash_size);
 
   const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
@@ -260,6 +272,10 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   void formatStatsReply(char* reply) override;
   void formatRadioStatsReply(char* reply) override;
   void formatPacketStatsReply(char* reply) override;
+  void startRegionsLoad() override;
+  bool saveRegions() override;
+  void onDefaultRegionChanged(const RegionEntry* r) override;
+  bool setRxBoostedGain(bool enable) override;
 
   mesh::LocalIdentity& getSelfId() override { return self_id; }
   void saveIdentity(const mesh::LocalIdentity& new_id) override;
