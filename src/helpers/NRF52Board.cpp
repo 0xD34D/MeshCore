@@ -1,5 +1,6 @@
 #if defined(NRF52_PLATFORM)
 #include "NRF52Board.h"
+#include <target.h>
 
 #include <bluefruit.h>
 #include <nrf_soc.h>
@@ -63,20 +64,6 @@ void NRF52Board::initPowerMgr() {
   } else {
     MESH_DEBUG_PRINTLN("PWRMGT: Reset = %s (0x%lX)",
       getResetReasonString(reset_reason), (unsigned long)reset_reason);
-  }
-}
-
-bool NRF52Board::isExternalPowered() {
-  // Check if SoftDevice is enabled before using its API
-  uint8_t sd_enabled = 0;
-  sd_softdevice_is_enabled(&sd_enabled);
-
-  if (sd_enabled) {
-    uint32_t usb_status;
-    sd_power_usbregstatus_get(&usb_status);
-    return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
-  } else {
-    return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
   }
 }
 
@@ -251,6 +238,20 @@ void NRF52BoardDCDC::begin() {
   }
 }
 
+bool NRF52Board::isExternalPowered() {
+  // Check if SoftDevice is enabled before using its API
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+
+  if (sd_enabled) {
+    uint32_t usb_status;
+    sd_power_usbregstatus_get(&usb_status);
+    return (usb_status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  } else {
+    return (NRF_POWER->USBREGSTATUS & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+  }
+}
+
 void NRF52Board::sleep(uint32_t secs) {
   // Clear FPU interrupt flags to avoid insomnia
   // see errata 87 for details https://docs.nordicsemi.com/bundle/errata_nRF52840_Rev3/page/ERR/nRF52840/Rev3/latest/anomaly_840_87.html
@@ -295,6 +296,56 @@ float NRF52Board::getMCUTemperature() {
   NRF_TEMP->TASKS_STOP = 1;
 
   return temp * 0.25f; // Convert to *C
+}
+
+void NRF52Board::powerOff() {
+  // Power off the display if any
+#ifdef DISPLAY_CLASS
+  display.turnOff();
+#endif
+
+  // Power off LoRa
+  radio_driver.powerOff();
+
+  // Keep LoRa inactive during deepsleep
+  digitalWrite(P_LORA_NSS, HIGH);
+
+  // Power off GPS if any
+  if(sensors.getLocationProvider() != NULL) {
+    sensors.getLocationProvider()->stop();
+  }
+
+  // Flush serial buffers
+  Serial.flush();
+  delay(100);
+
+  // Enter SYSTEMOFF
+  uint8_t sd_enabled = 0;
+  sd_softdevice_is_enabled(&sd_enabled);
+  if (sd_enabled) { // SoftDevice is enabled
+    sd_power_system_off();
+  } else { // SoftDevice is not enable
+    NRF_POWER->SYSTEMOFF = POWER_SYSTEMOFF_SYSTEMOFF_Enter;
+  }
+}
+
+bool NRF52Board::getBootloaderVersion(char* out, size_t max_len) {
+    static const char BOOTLOADER_MARKER[] = "UF2 Bootloader ";
+    const uint8_t* flash = (const uint8_t*)0x000FB000; // earliest known info.txt location is 0xFB90B, latest is 0xFCC4B
+
+    for (uint32_t i = 0; i < 0x3000 - (sizeof(BOOTLOADER_MARKER) - 1); i++) {
+        if (memcmp(&flash[i], BOOTLOADER_MARKER, sizeof(BOOTLOADER_MARKER) - 1) == 0) {
+            const char* ver = (const char*)&flash[i + sizeof(BOOTLOADER_MARKER) - 1];
+            size_t len = 0;
+            while (len < max_len - 1 && ver[len] != '\0' && ver[len] != ' ' && ver[len] != '\n' && ver[len] != '\r') {
+                out[len] = ver[len];
+                len++;
+            }
+            out[len] = '\0';
+            return len > 0; // bootloader string is non-empty
+        }
+    }
+    return false;
 }
 
 bool NRF52Board::startOTAUpdate(const char *id, char reply[]) {
